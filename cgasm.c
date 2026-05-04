@@ -1,3 +1,6 @@
+// cgasm.c - Cg assembly/NTint assembly compiler
+// build: cl cgasm.c /Fe:cgasm.exe   or   gcc cgasm.c -o cgasm
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +9,7 @@
 
 #ifdef _WIN32
 #define strcasecmp _stricmp
+#define strncasecmp _strnicmp
 #endif
 
 // Opcodes
@@ -37,6 +41,8 @@ static void trim(char *s) {
 
 static int lookup_reg(const char *name) {
     int neg = 0;
+    char lower[64];
+    size_t i = 0;
 
     // Handle unary minus
     if (name[0] == '-') {
@@ -44,29 +50,52 @@ static int lookup_reg(const char *name) {
         name++;
     }
 
+    while (*name && i + 1 < sizeof(lower)) {
+        lower[i++] = (char)tolower((unsigned char)*name);
+        name++;
+    }
+    lower[i] = '\0';
+
     int reg_id = -1;
 
-    if (strcmp(name, "oPos") == 0) {
+    if (strcmp(lower, "opos") == 0) {
         reg_id = 32;
     }
-    else if (name[0] == 'o' && name[1] == 'D') {
-        int idx = atoi(name + 2);
+    else if (strcmp(lower, "result.color") == 0) {
+        reg_id = 40; // oD0 = fragment output color
+    }
+    else if (lower[0] == 'o' && lower[1] == 'd') {
+        int idx = atoi(lower + 2);
         reg_id = 40 + idx; // oD0 = 40
     }
-    else if (name[0] == 'o' && name[1] == 'T') {
-        int idx = atoi(name + 2);
+    else if (lower[0] == 'o' && lower[1] == 't') {
+        int idx = atoi(lower + 2);
         reg_id = 48 + idx; // oT0 = 48
     }
-    else if (name[0] == 'v') {
-        int idx = atoi(name + 1);
+    else if (strncmp(lower, "fragment.texcoord[", 16) == 0) {
+        int idx = atoi(lower + 16);
+        reg_id = idx; // map fragment.texcoord[n] -> v<n>
+    }
+    else if (strcmp(lower, "fragment.color.primary") == 0) {
+        reg_id = 4; // map primary fragment color to v4
+    }
+    else if (strcmp(lower, "fragment.color.secondary") == 0) {
+        reg_id = 5; // map secondary fragment color to v5
+    }
+    else if (strncmp(lower, "texture[", 8) == 0) {
+        int idx = atoi(lower + 8);
+        reg_id = 16 + idx; // map texture[n] -> c<n> as sampler index
+    }
+    else if (lower[0] == 'v') {
+        int idx = atoi(lower + 1);
         reg_id = idx;      // v0 = 0
     }
-    else if (name[0] == 'c') {
-        int idx = atoi(name + 1);
+    else if (lower[0] == 'c') {
+        int idx = atoi(lower + 1);
         reg_id = 16 + idx; // c0 = 16
     }
-    else if (name[0] == 'r') {
-        int idx = atoi(name + 1);
+    else if (lower[0] == 'r') {
+        int idx = atoi(lower + 1);
         reg_id = 80 + idx; // r0 = 80
     }
 
@@ -135,6 +164,37 @@ int main(int argc, char **argv) {
     while (fgets(line, sizeof(line), fin)) {
         trim(line);
         if (!line[0] || line[0] == ';') continue;
+        char *comment = strchr(line, ';');
+        if (comment) {
+            *comment = '\0';
+            trim(line);
+        }
+        if (!line[0]) continue;
+
+        if (!strncasecmp(line, "temp", 4) && isspace((unsigned char)line[4])) {
+            char *p = line + 4;
+            while (*p && isspace((unsigned char)*p)) p++;
+            while (*p) {
+                char reg[64] = {0};
+                int ri = 0;
+                while (*p && *p != ',' && !isspace((unsigned char)*p) && ri + 1 < (int)sizeof(reg)) {
+                    reg[ri++] = *p++;
+                }
+                reg[ri] = '\0';
+                trim(reg);
+                if (reg[0]) {
+                    if (lookup_reg(reg) < 0) {
+                        fprintf(stderr, "unknown temp reg: %s\n", reg);
+                    }
+                }
+                while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+            }
+            continue;
+        }
+
+        if (!strncasecmp(line, "end", 3) && (line[3] == '\0' || isspace((unsigned char)line[3]))) {
+            break;
+        }
 
         // --- DEF handling ---
         if (!strncmp(line, "def", 3) || !strncmp(line, "DEF", 3)) {
@@ -174,7 +234,7 @@ int main(int argc, char **argv) {
         char src1[64] = {0};
         char src2[64] = {0};
 
-        int n = sscanf(line, "%31s %63[^,], %63[^,], %63s",
+        int n = sscanf(line, "%31s %63[^,], %63[^,], %63[^,]",
                        op, dst, src1, src2);
 
         if (n < 3) {
@@ -230,7 +290,9 @@ int main(int argc, char **argv) {
         char dst_base[64] = {0};
         char dst_mask_str[16] = {0};
         char *dst_dot = strchr(dst, '.');
-        if (dst_dot) {
+        if (dst_dot && dst_dot[1] && !strchr("xyzw", dst_dot[1])) {
+            strncpy(dst_base, dst, sizeof(dst_base) - 1);
+        } else if (dst_dot) {
             size_t len = (size_t)(dst_dot - dst);
             if (len >= sizeof(dst_base)) len = sizeof(dst_base) - 1;
             memcpy(dst_base, dst, len);
@@ -244,7 +306,9 @@ int main(int argc, char **argv) {
         char src1_base[64] = {0};
         char src1_swiz[16] = {0};
         char *dot = strchr(src1, '.');
-        if (dot) {
+        if (dot && dot[1] && !strchr("xyzw", dot[1])) {
+            strncpy(src1_base, src1, sizeof(src1_base) - 1);
+        } else if (dot) {
             size_t len = (size_t)(dot - src1);
             if (len >= sizeof(src1_base)) len = sizeof(src1_base) - 1;
             memcpy(src1_base, src1, len);
